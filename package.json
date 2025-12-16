@@ -1,0 +1,11 @@
+{
+  "name": "piano-ssem",
+  "version": "1.0.0",
+  "description": "Piano practice app",
+  "scripts": {
+    "server": "python -m http.server 8000"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

@@ -1144,7 +1144,14 @@ function drawGame(currentTime) {
             // But if the note top pushes it down, let it slide down.
             // "0.5 sec before end" means we add a buffer of 0.5 * fallingSpeed
             const earlyRelease = fallingSpeed * 0.3; 
-            let keyY = Math.max(noteTop + keyFontSize + earlyRelease, Math.min(keyYRaw2, visibleBottom2));
+            
+            // Calculate the target position (docked or pushed down)
+            const targetY = Math.max(noteTop + keyFontSize + earlyRelease, visibleBottom2);
+            
+            // Clamp:
+            // 1. Math.min(keyYRaw2, targetY) -> Don't go below the bottom of the note (prevents detaching downwards)
+            // 2. Math.max(noteTop + ..., ...) -> Don't go above the top of the note (prevents detaching upwards/floating)
+            let keyY = Math.max(noteTop + keyFontSize + 2, Math.min(keyYRaw2, targetY));
 
             const handFontSize = isCompact ? 12 : 14;
             const superFontSize = isCompact ? 9 : 11;

@@ -31,6 +31,9 @@ const BLACK_KEY_WIDTH_RATIO = 0.72 * 1.2;
 const BLACK_KEY_HEIGHT_RATIO = 0.54 * 1.2;
 const keyHeight = 100;
 
+// distance (px) from the key top where we consider a note "close"
+const CLOSE_NOTE_MARGIN = Math.max(40, keyHeight);
+
 // 상태 변수
 let currentZoom = 100;
 let baseWidth = 1000; 
@@ -41,6 +44,10 @@ let isPaused = false;
 let pauseTime = 0;
 let startTime = 0;
 let animationId;
+let loopTimer = null; // fallback timer when tab is hidden
+let sectionStartTime = 0;
+let sectionEndTime = Infinity;
+const SECTION_PRE_DELAY = 3.0; // seconds of lead-in before a selected section starts
 let speed = 1.0;
 let currentLoop = 0;
 let loopCount = 0;
@@ -523,6 +530,22 @@ function parseMidi(midi) {
 
 // --- 5. 렌더링 함수 ---
 
+// 노트 블럭에 사용할 공용 라운드 사각형 경로
+function roundedRectPath(x, y, width, height, radius) {
+    const r = Math.min(radius, width / 2, height / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + width - r, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + r);
+    ctx.lineTo(x + width, y + height - r);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+    ctx.lineTo(x + r, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+}
+
 function drawFullHeightBeams(activeBeams) {
     const viewHeight = logicalHeight - keyHeight;
     const keyW = logicalWidth / totalWhiteKeys;
@@ -531,6 +554,9 @@ function drawFullHeightBeams(activeBeams) {
     Object.keys(activeBeams).forEach(midi => {
         const info = activeBeams[midi];
         if (info.source === 'input') return;
+        // 섹션 재생 시 이전 구간 노트는 표시하지 않음
+        if (sectionStartTime > 0 && info.startTime !== undefined && info.startTime < sectionStartTime - 0.0001) return;
+        if (info.startTime !== undefined && info.startTime >= sectionEndTime - 0.0001) return;
 
         const x = getNoteX(midi);
         const beamX = x + (isWhiteKey(midi) ? keyW/2 : keyW*BLACK_KEY_WIDTH_RATIO/2) - (bWidth / 2);
@@ -568,6 +594,8 @@ function drawNotes(currentTime) {
         const showLeft = document.getElementById('chk-left').checked;
         if(n.hand === 'right' && !showRight) return;
         if(n.hand === 'left' && !showLeft) return;
+        if (sectionStartTime > 0 && n.startTime < sectionStartTime - 0.0001) return; // 구간 시작 이전 노트 숨기기
+        if (n.startTime >= sectionEndTime - 0.0001) return; // 구간 끝 이후 노트 숨기기
 
         const timeDiff = n.startTime - currentTime;
         if (timeDiff + n.durationTime < -1) return;
@@ -578,61 +606,71 @@ function drawNotes(currentTime) {
         const x = getNoteX(n.note);
         const width = isWhiteKey(n.note) ? keyW - 2 : keyW * BLACK_KEY_WIDTH_RATIO;
         
-        // [수정] 둥근 모서리(radius) 제거하고 직각 사각형으로 변경
-        ctx.beginPath();
-        ctx.rect(x, y - height, width, height - 2);
+        const noteTop = y - height;
+        const noteHeight = height - 2;
+
+        // 노트 블럭: 둥근 모서리 + 흰색 테두리
         ctx.save();
-        ctx.clip();
+        roundedRectPath(x, noteTop, width, noteHeight, 5);
         ctx.fillStyle = n.color || '#888';
         ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
         ctx.restore();
 
         // 텍스트 색상 결정 (노트 내부용)
         const innerTextColor = (n.color === COLORS.YELLOW || n.color === COLORS.GREEN) ? '#000' : '#fff';
         const noteName = getNoteName(n.note);
         const centerX = x + width / 2;
+        const isCompact = noteHeight < 40;
 
-        if (n.finger) {
-            // 손가락 번호가 있는 경우
-            if (height < 35) {
-                // [수정] 짧은 노트: 손가락 번호는 내부, 음이름은 외부 상단에 표시
-                
-                // 1. 손가락 번호 (내부 중앙)
-                ctx.fillStyle = innerTextColor;
-                ctx.font = 'bold 14px Arial';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(n.finger, centerX, y - height/2);
+        // 화면 내에서 텍스트가 가려지지 않도록 단순 위치 고정 + 하단 클램프
+        const clamp = (v, mn, mx) => Math.min(mx, Math.max(mn, v));
+        const visibleBottom = logicalHeight - 6;
+        const noteBottom = y; // 노트의 하단
 
-                // 2. 음이름 (외부 상단 - 항상 숫자 위에)
-                ctx.fillStyle = '#fff'; // 배경이 검정이므로 흰색
-                ctx.font = '12px Arial';
-                ctx.textBaseline = 'bottom';
-                ctx.fillText(noteName, centerX, y - height - 2); 
-            } else {
-                // 긴 노트: 내부 하단에 둘 다 표시
+        // 텍스트 위치/크기 설정
+        const keyFontSize = isCompact ? 16 : 20;
+        const keyPadding = isCompact ? 4 : 6;
+        const keyYRaw = noteBottom - keyPadding;
+        const keyY = clamp(keyYRaw, noteTop + keyFontSize + 2, visibleBottom);
+
+        const handFontSize = isCompact ? 12 : 14;
+        const superFontSize = isCompact ? 9 : 11;
+        const handGap = isCompact ? 3 : 4; // key 라인 위 여백
+
+            // Compute hand baseline and force it to remain visibly above the note name
+            let handBaselineY = keyYRaw - keyFontSize - handGap;
+            const minHandBaseline = noteTop + handFontSize + 2;
+            // Ensure hand label sits above the note name by at least handFontSize + small margin
+            const maxHandBaseline = keyY - handFontSize - 6;
+            handBaselineY = clamp(handBaselineY, minHandBaseline, maxHandBaseline);
+
+        ctx.textBaseline = 'alphabetic';
+
+        // If the note is very close to the keys we will redraw its text after the keyboard
+        // (so it remains visible on top). Skip drawing the in-note text in that case.
+        if (y <= viewHeight - CLOSE_NOTE_MARGIN) {
+            // 상단: 손^손가락 번호 (수퍼 스크립트 배치)
+            if (n.hand && n.finger) {
                 ctx.fillStyle = innerTextColor;
-                
-                // 손가락 번호
-                ctx.font = 'bold 20px Arial';
-                ctx.textBaseline = 'bottom';
-                ctx.fillText(n.finger, centerX, y - 2);
-                
-                // 음이름
-                ctx.font = '16px Arial';
-                ctx.fillText(noteName, centerX, y - 22);
+
+                const handLabel = n.hand === 'left' ? 'L' : 'R';
+                ctx.font = `bold ${handFontSize}px Arial`;
+                const handWidth = ctx.measureText(handLabel).width;
+                ctx.fillText(handLabel, centerX - superFontSize * 0.5, handBaselineY);
+
+                ctx.font = `bold ${superFontSize}px Arial`;
+                const superY = handBaselineY - handFontSize * 0.55;
+                const superX = centerX + handWidth * 0.5;
+                ctx.fillText(n.finger, superX, superY);
             }
-        } else {
-            // 손가락 번호가 없는 경우
+
+            // 하단: 음 이름
             ctx.fillStyle = innerTextColor;
-            if (height < 35) {
-                ctx.font = 'bold 14px Arial';
-                ctx.textBaseline = 'middle';
-                ctx.fillText(noteName, centerX, y - height/2);
-            } else {
-                ctx.font = 'bold 16px Arial';
-                ctx.textBaseline = 'bottom';
-                ctx.fillText(noteName, centerX, y - 2);
-            }
+            ctx.font = `bold ${keyFontSize}px Arial`;
+            ctx.fillText(noteName, centerX, keyY);
         }
     });
 }
@@ -1006,6 +1044,13 @@ document.getElementById('chk-left').addEventListener('change', () => {
     alignViewToMode();
 });
 
+// 탭 비활성화 시에도 루프가 유지되도록 처리
+document.addEventListener('visibilitychange', () => {
+    if (!isPlaying) return;
+    ensureAudioActive();
+    scheduleLoopFrame();
+});
+
 // --- 7. 오디오 및 게임 루프 ---
 
 function playTone(midi, duration) {
@@ -1022,31 +1067,41 @@ function getCurrentTime() {
 
 function drawGame(currentTime) {
     ctx.clearRect(0, 0, logicalWidth, logicalHeight);
-
     // 1. 노트 상태 계산 (Active Beams & Key Visuals 통합)
     const activeBeams = {}; // 노트에 의한 시각 효과 (빔 + 건반)
     const viewHeight = logicalHeight - keyHeight;
+    const keyW = logicalWidth / totalWhiteKeys;
+
+    // collect notes that are very close to the keyboard (to hide dock and draw persistent labels)
+    const closeNotes = [];
+    const CLOSE_THRESHOLD = CLOSE_NOTE_MARGIN; // px above key top
 
     notes.forEach(n => {
         const showRight = document.getElementById('chk-right').checked;
         const showLeft = document.getElementById('chk-left').checked;
-        if(n.hand === 'right' && !showRight) return;
-        if(n.hand === 'left' && !showLeft) return;
+        if (n.hand === 'right' && !showRight) return;
+        if (n.hand === 'left' && !showLeft) return;
+        if (sectionStartTime > 0 && n.startTime < sectionStartTime - 0.0001) return; // Hide notes before section start
+        if (n.startTime >= sectionEndTime - 0.0001) return; // Hide notes after section end
 
         const timeDiff = n.startTime - currentTime;
-        const yTop = viewHeight - (timeDiff * fallingSpeed) - (n.durationTime * fallingSpeed); 
-        const yBottom = viewHeight - (timeDiff * fallingSpeed); 
-        
+        const yTop = viewHeight - (timeDiff * fallingSpeed) - (n.durationTime * fallingSpeed);
+        const yBottom = viewHeight - (timeDiff * fallingSpeed);
         const isPlayingNote = (currentTime >= n.startTime && currentTime < n.startTime + n.durationTime);
-        const isFalling = (yBottom > 0 && yTop < viewHeight); 
+        const isFalling = (yBottom > 0 && yTop < viewHeight);
 
         // 우선순위: 연주 중(2) > 떨어지는 중(1)
-        // 같은 상태라면 먼저 처리된(화면 아래쪽, 시간이 빠른) 노트의 색상을 유지
         const newStatus = isPlayingNote ? 2 : (isFalling ? 1 : 0);
-        
         if (newStatus > 0) {
-                if (!activeBeams[n.note] || activeBeams[n.note].status < newStatus) {
-                activeBeams[n.note] = { status: newStatus, color: n.color, source: 'note' };
+            if (!activeBeams[n.note] || activeBeams[n.note].status < newStatus) {
+                activeBeams[n.note] = { status: newStatus, color: n.color, source: 'note', startTime: n.startTime };
+            }
+        }
+
+        // determine if this note is almost down (close to keys)
+        if (!(timeDiff + n.durationTime < -1) && (timeDiff * fallingSpeed <= viewHeight)) {
+            if (yBottom > viewHeight - CLOSE_THRESHOLD) {
+                closeNotes.push({ n, yBottom, x: getNoteX(n.note), width: isWhiteKey(n.note) ? keyW - 2 : keyW * BLACK_KEY_WIDTH_RATIO });
             }
         }
     });
@@ -1054,20 +1109,141 @@ function drawGame(currentTime) {
     // 2. 렌더링
     drawFullHeightBeams(activeBeams); // 빔 그리기
     drawNotes(currentTime); // 노트 블럭 그리기
-    
+
+    // 2.5 Re-draw the existing note text for close notes (BEFORE keyboard so it appears behind keys)
+    if (closeNotes.length > 0) {
+        ctx.save();
+        closeNotes.forEach(item => {
+            const { n, x, width, yBottom } = item;
+
+            const centerX = x + width / 2;
+
+            // Recompute dimensions similar to drawNotes
+            const height = Math.max(n.durationTime * fallingSpeed, 20);
+            const noteTop = yBottom - height;
+
+            // Only stop drawing if the note is completely past the view (finished)
+            if (noteTop > viewHeight) return;
+
+            const noteHeight = height - 2;
+
+            // Text color and sizes (mirror drawNotes)
+            const innerTextColor = (n.color === COLORS.YELLOW || n.color === COLORS.GREEN) ? '#000' : '#fff';
+            const noteName = getNoteName(n.note);
+            const isCompact = noteHeight < 40;
+            const keyFontSize = isCompact ? 16 : 20;
+            const keyPadding = isCompact ? 4 : 6;
+            const keyYRaw2 = yBottom - keyPadding;
+            const clamp = (v, mn, mx) => Math.min(mx, Math.max(mn, v));
+            
+            const VERTICAL_MARGIN = 6; // px above keys
+            // visibleBottom2 is the "dock" line just above the keyboard
+            const visibleBottom2 = logicalHeight - keyHeight - VERTICAL_MARGIN;
+            
+            // Logic: Try to clamp to visibleBottom2 (dock). 
+            // But if the note top pushes it down, let it slide down.
+            // "0.5 sec before end" means we add a buffer of 0.5 * fallingSpeed
+            const earlyRelease = fallingSpeed * 0.3; 
+            let keyY = Math.max(noteTop + keyFontSize + earlyRelease, Math.min(keyYRaw2, visibleBottom2));
+
+            const handFontSize = isCompact ? 12 : 14;
+            const superFontSize = isCompact ? 9 : 11;
+            const handGap = isCompact ? 3 : 4;
+
+            // Compute hand baseline and force it to remain visibly above the note name
+            let handBaselineY = keyYRaw2 - keyFontSize - handGap;
+            const minHandBaseline = noteTop + handFontSize + 2;
+            // Ensure hand label sits above the note name by at least handFontSize + small margin
+            const maxHandBaseline = keyY - handFontSize - 6;
+            handBaselineY = clamp(handBaselineY, minHandBaseline, maxHandBaseline);
+
+            ctx.textBaseline = 'alphabetic';
+            ctx.textAlign = 'center';
+
+            // Draw hand and finger (as in drawNotes)
+            if (n.hand && n.finger) {
+                ctx.fillStyle = innerTextColor;
+
+                const handLabel = n.hand === 'left' ? 'L' : 'R';
+                ctx.font = `bold ${handFontSize}px Arial`;
+                const handWidth = ctx.measureText(handLabel).width;
+                ctx.fillText(handLabel, centerX - superFontSize * 0.5, handBaselineY);
+
+                ctx.font = `bold ${superFontSize}px Arial`;
+                const superY = handBaselineY - handFontSize * 0.55;
+                const superX = centerX + handWidth * 0.5;
+                ctx.fillText(n.finger, superX, superY);
+            }
+
+            // Draw note name (as in drawNotes)
+            ctx.fillStyle = innerTextColor;
+            ctx.font = `bold ${keyFontSize}px Arial`;
+            ctx.fillText(noteName, centerX, keyY);
+        });
+        ctx.restore();
+    }
+
     // 3. 건반 렌더링 데이터 병합
-    // activeBeams(노트 효과) + currentPressedNotes(유저 입력)
     const keyVisuals = { ...activeBeams };
     currentPressedNotes.forEach(n => {
-        // 유저 입력은 항상 가장 강한 상태(2)로 표시, 유저 입력 색상 우선
         keyVisuals[n.note] = { status: 2, color: n.color || COLORS.CORRECT, source: 'input' };
     });
 
     drawKeyboard(keyVisuals); // 건반 그리기
+
+    // 4. If any note is very close to the keys, hide the center guide (dock)
+    const centerGuide = document.getElementById('center-guide');
+    if (centerGuide) {
+        // explicitly hide/show the guide so CSS behavior is predictable
+        if (closeNotes.length > 0) centerGuide.style.display = 'none';
+        else centerGuide.style.display = 'block';
+    }
+}
+
+const HIDDEN_LOOP_FPS = 30;
+
+function ensureAudioActive() {
+    if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+    if (Tone.context && Tone.context.state === 'suspended') {
+        Tone.context.resume();
+    }
+}
+
+function clearLoopTimers() {
+    if (animationId) {
+        cancelAnimationFrame(animationId);
+        animationId = null;
+    }
+    if (loopTimer) {
+        clearTimeout(loopTimer);
+        loopTimer = null;
+    }
+}
+
+function scheduleLoopFrame() {
+    if (!isPlaying) return;
+    const hidden = document.visibilityState === 'hidden';
+    if (hidden) {
+        if (animationId) {
+            cancelAnimationFrame(animationId);
+            animationId = null;
+        }
+        if (loopTimer) clearTimeout(loopTimer);
+        loopTimer = setTimeout(loop, 1000 / HIDDEN_LOOP_FPS);
+    } else {
+        if (loopTimer) {
+            clearTimeout(loopTimer);
+            loopTimer = null;
+        }
+        animationId = requestAnimationFrame(loop);
+    }
 }
 
 function loop() {
     if(!isPlaying) return;
+    ensureAudioActive();
     const currentTime = getCurrentTime();
     
     // 채점 상태 업데이트 (수정됨: 체크박스 해제된 손은 Miss 처리 안함)
@@ -1101,6 +1277,7 @@ function loop() {
         const playLeft = document.getElementById('chk-left').checked;
         if(n.hand === 'right' && !playRight) return;
         if(n.hand === 'left' && !playLeft) return;
+        if (n.startTime >= sectionEndTime - 0.0001) return;
         
         if (!n.played && currentTime >= n.startTime) {
             playTone(n.note, n.durationTime);
@@ -1110,32 +1287,11 @@ function loop() {
 
     drawGame(currentTime);
     
-    let endTime = songDuration;
-    if (currentSection !== null) {
-        if (isDefaultSong) {
-            const sectionIdx = parseInt(document.getElementById('sel-section').value);
-            const beatsPerSection = 16; // 4마디 * 4박자 = 16박자
-            const beatDuration = 0.8; // 1박자당 0.8초
-            const sectionDuration = beatsPerSection * beatDuration;
-            
-            const sectionStart = sectionIdx * sectionDuration;
-            endTime = sectionStart + sectionDuration + startOffset + 0.1;
-        } else {
-            const sectionIdx = parseInt(document.getElementById('sel-section').value);
-            const groupSize = 4;
-            const startMeasureIdx = sectionIdx * groupSize;
-            const endMeasureIdx = Math.min(startMeasureIdx + groupSize, measureTimes.length - 1);
-            if (measureTimes[endMeasureIdx]) {
-                endTime = measureTimes[endMeasureIdx] + startOffset + 0.1; // 구간 끝 여유 시간 1.0초 -> 0.1초로 단축
-            }
-        }
-    }
-    
-    if (currentTime > endTime) {
+    if (currentTime >= sectionEndTime) {
         handleSongEnd();
         return;
     }
-    animationId = requestAnimationFrame(loop);
+    scheduleLoopFrame();
 }
 
 function handleSongEnd() {
@@ -1154,31 +1310,63 @@ function handleSongEnd() {
 function resetPlaybackToSectionStart() {
     const sectionIdx = parseInt(document.getElementById('sel-section').value);
     let loopStartTime = 0;
+    let loopEndTime = songDuration;
     
     if (sectionIdx !== -1) {
         if (isDefaultSong) {
             const beatsPerSection = 16; // 4마디 * 4박자 = 16박자
             const beatDuration = 0.8; // 1박자당 0.8초
             loopStartTime = sectionIdx * beatsPerSection * beatDuration;
+            loopEndTime = loopStartTime + beatsPerSection * beatDuration;
         } else {
             const startMeasureIdx = sectionIdx * 4;
             if (startMeasureIdx < measureTimes.length) {
                 loopStartTime = measureTimes[startMeasureIdx];
             }
+            const endMeasureIdx = Math.min(startMeasureIdx + 4, measureTimes.length - 1);
+            if (measureTimes[endMeasureIdx] !== undefined) {
+                loopEndTime = measureTimes[endMeasureIdx];
+            }
         }
     }
     
-    const effectiveStartTime = loopStartTime + startOffset;
-    
-    notes.forEach(n => {
-        if (n.startTime < effectiveStartTime) {
-            n.played = true; 
-        } else {
-            n.played = false; 
-        }
-    });
+    // 섹션 선택 시 즉시 해당 구간으로 이동 (이전 구간 미표시/무음 대기 제거)
+    const resetNoteState = (markPlayedBeforeStart) => {
+        notes.forEach(n => {
+            n.scoreStatus = 'pending';
+            if (n.hand === 'left') {
+                n.color = LEFT_FINGER_COLOR_MAP[n.finger] || '#888';
+            } else {
+                n.color = FINGER_COLOR_MAP[n.finger] || '#888';
+            }
+            if (sectionIdx !== -1 && n.startTime >= sectionEndTime) {
+                n.played = true; // 구간 끝 이후 노트는 건너뛴다
+            } else if (markPlayedBeforeStart && n.startTime < sectionStartTime) {
+                n.played = true;
+            } else {
+                n.played = false;
+            }
+        });
+    };
 
-    startTime = audioCtx.currentTime - loopStartTime;
+    if (sectionIdx === -1) {
+        sectionStartTime = 0;
+        sectionEndTime = songDuration;
+        resetNoteState(false);
+        startTime = audioCtx.currentTime; // 기존 전체 재생 동작 유지
+    } else {
+        sectionStartTime = loopStartTime + startOffset;
+        sectionEndTime = loopEndTime + startOffset;
+        resetNoteState(true);
+
+        // 현재 시간을 섹션 시작 지점에 맞춤 (speed 반영)
+        const preDelay = Math.max(0, SECTION_PRE_DELAY);
+        startTime = audioCtx.currentTime - ((sectionStartTime - preDelay) / speed);
+    }
+
+    // 섹션 시작 시점 이후 첫 노트로 nextNoteIndex 이동
+    nextNoteIndex = notes.findIndex(n => !n.played);
+    if (nextNoteIndex === -1) nextNoteIndex = notes.length;
 }
 
 function updateSectionDropdown() {
@@ -1257,7 +1445,7 @@ function pauseGame() {
     if (!isPlaying) return;
     isPlaying = false;
     isPaused = true;
-    cancelAnimationFrame(animationId);
+    clearLoopTimers();
     pauseTime = audioCtx.currentTime;
     playBtn.innerText = "▶ 재생";
     statusMsg.innerText = "일시정지됨\n(화면을 터치하면 다시 시작됩니다)";
@@ -1268,7 +1456,7 @@ function pauseGame() {
 function stopGame(fullReset = true) {
     isPlaying = false;
     isPaused = false;
-    cancelAnimationFrame(animationId);
+    clearLoopTimers();
     playBtn.innerText = "▶ 재생";
     if(fullReset) {
         notes.forEach(n => { 
